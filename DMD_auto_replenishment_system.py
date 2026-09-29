@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DMD automatic replenishment decision system v1.4 (Google Drive master/output + sales-growth mode + FBA price basis)
+# DMD automatic replenishment decision system v1.4.1 (Google Drive master/output + sales-growth mode + FBA price basis)
 import os, re, math, time, getpass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -215,18 +215,21 @@ def classify_input_file(path):
     return None
 
 
-def mount_google_drive():
-    """ColabではGoogle Driveをマウント。ローカル実行時は何もしない。"""
-    try:
-        from google.colab import drive
-        drive.mount('/content/drive', force_remount=False)
-        print('Google Drive接続: OK')
-    except ImportError:
-        pass
+def check_google_drive():
+    """v1.4.1.1: Driveの認証UIは.py内から呼ばず、Colabセル側で事前マウントする。"""
+    drive_root = Path('/content/drive')
+    if not drive_root.exists():
+        raise RuntimeError(
+            "Google Driveがマウントされていません。Colabの別セルで\n"
+            "from google.colab import drive\n"
+            "drive.mount('/content/drive')\n"
+            "を実行してから、このプログラムを実行してください。"
+        )
+    print('Google Drive接続: OK（マウント済み）')
 
 
 def choose_files_interactive():
-    """v1.4: 商品マスタはDrive固定。売上・在庫の2ファイルだけ選択する。"""
+    """v1.4.1: 商品マスタはDrive固定。売上・在庫の2ファイルだけ選択する。"""
     supported = ('.xlsx', '.xlsm', '.csv')
     try:
         from google.colab import files
@@ -272,7 +275,7 @@ def unique_output_path(result_dir, base_name):
         i += 1
 
 def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=None, output_path=None):
-    mount_google_drive()
+    check_google_drive()
     if not os.path.exists(master_path):
         raise FileNotFoundError(f'商品マスタが見つかりません: {master_path}')
     print(f'商品マスタ: OK\n  {master_path}')
@@ -356,7 +359,7 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         r['目標在庫日数']=target_days; r['目標在庫数']=target_stock
         r['推奨発注数']=ceil_unit(shortage,m.get('最小発注数'),m.get('発注単位'),m.get('ケース入数')) if r['90日販売']>0 else 0
 
-        # v1.4: 採算計算は現在のFBA最安値を最優先。FBA不在時のみ新品最安値へフォールバック。
+        # v1.4.1: 採算計算は現在のFBA最安値を最優先。FBA不在時のみ新品最安値へフォールバック。
         if r.get('lowest_fba') is not None:
             sale_price=r.get('lowest_fba'); price_type='FBA最安値'
         elif r.get('lowest_new') is not None:
