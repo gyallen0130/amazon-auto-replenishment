@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DMD automatic replenishment decision system v1.3 (Japan Keepa price fix + Amazon CSV/xlsx/xlsm support)
+# DMD automatic replenishment decision system v1.4 (Google Drive master/output + sales-growth mode + FBA price basis)
 import os, re, math, time, getpass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,9 +16,10 @@ MIN_TOKENS_LEFT = 35
 FRESH_MINUTES = 180
 DEFAULT_LEAD_DAYS = 7
 DEFAULT_SAFETY_DAYS = 7
-ROI_MIN = 0.10
-PROFIT_MIN_YEN = 100
+MIN_PROFIT_MARGIN = 0.0  # 売上拡大モード: 利益率0%以上を仕入れ候補
 OFFERS_COVER_DAYS = 30
+MASTER_PATH = '/content/drive/MyDrive/02_AI業務効率化/AI仕入れ判断/product_master.xlsm'
+RESULT_DIR = '/content/drive/MyDrive/02_AI業務効率化/AI仕入れ判断/01_出力結果'
 
 
 def _looks_like_header(row):
@@ -214,53 +215,69 @@ def classify_input_file(path):
     return None
 
 
+def mount_google_drive():
+    """ColabではGoogle Driveをマウント。ローカル実行時は何もしない。"""
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive', force_remount=False)
+        print('Google Drive接続: OK')
+    except ImportError:
+        pass
+
+
 def choose_files_interactive():
+    """v1.4: 商品マスタはDrive固定。売上・在庫の2ファイルだけ選択する。"""
     supported = ('.xlsx', '.xlsm', '.csv')
     try:
         from google.colab import files
-        print('売上CSV/XLSX/XLSM・在庫CSV/XLSX/XLSM・商品マスタXLSX/XLSM をまとめて選択してください。')
-        print('※ ファイル名ではなく列名を見て自動判別します。')
+        print('売上ファイルと在庫ファイルの2つを選択してください。')
+        print('※ 商品マスタはGoogle Driveから自動で読み込みます。')
         uploaded = files.upload()
         names = [n for n in uploaded.keys() if Path(n).suffix.lower() in supported]
     except Exception:
         names = [p.name for p in Path('.').iterdir() if p.suffix.lower() in supported]
 
-    found = {'master': [], 'inventory': [], 'sales': []}
+    found = {'inventory': [], 'sales': []}
     for n in names:
         kind = classify_input_file(n)
-        if kind:
+        if kind in found:
             found[kind].append(n)
 
-    # 列判定できなかった場合のみファイル名を補助的に利用。
-    if not found['master']:
-        found['master'] = [n for n in names if 'product_master' in n.lower() or '商品マスタ' in n]
     if not found['inventory']:
         found['inventory'] = [n for n in names if '在庫' in n or 'inventory' in n.lower() or 'zaiko' in n.lower()]
     if not found['sales']:
         found['sales'] = [n for n in names if 'transaction' in n.lower() or '売上' in n or 'sales' in n.lower() or 'uriage' in n.lower()]
 
     result = {k: (v[0] if len(v) == 1 else None) for k, v in found.items()}
-    print('自動判別結果:', result)
-
-    # 複数候補/未判別だけ手入力にフォールバック。
+    print('自動判別結果:', {'master': MASTER_PATH, **result})
     if result['sales'] is None:
-        if len(found['sales']) > 1:
-            print('売上候補:', found['sales'])
+        if len(found['sales']) > 1: print('売上候補:', found['sales'])
         result['sales'] = input('売上ファイル名: ').strip()
     if result['inventory'] is None:
-        if len(found['inventory']) > 1:
-            print('在庫候補:', found['inventory'])
+        if len(found['inventory']) > 1: print('在庫候補:', found['inventory'])
         result['inventory'] = input('在庫ファイル名: ').strip()
-    if result['master'] is None:
-        if len(found['master']) > 1:
-            print('商品マスタ候補:', found['master'])
-        result['master'] = input('商品マスタ（.xlsx または .xlsm）のファイル名: ').strip()
+    return result['sales'], result['inventory']
 
-    return result['sales'], result['inventory'], result['master']
 
-def main(sales_path=None, inventory_path=None, master_path=None, api_key=None, output_path=None):
-    if not all((sales_path,inventory_path,master_path)):
-        sales_path,inventory_path,master_path=choose_files_interactive()
+def unique_output_path(result_dir, base_name):
+    """既存ファイルを上書きせず _02, _03... と採番。"""
+    os.makedirs(result_dir, exist_ok=True)
+    p = Path(result_dir) / base_name
+    if not p.exists(): return str(p)
+    stem, suffix = p.stem, p.suffix
+    i = 2
+    while True:
+        candidate = p.with_name(f'{stem}_{i:02d}{suffix}')
+        if not candidate.exists(): return str(candidate)
+        i += 1
+
+def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=None, output_path=None):
+    mount_google_drive()
+    if not os.path.exists(master_path):
+        raise FileNotFoundError(f'商品マスタが見つかりません: {master_path}')
+    print(f'商品マスタ: OK\n  {master_path}')
+    if not all((sales_path, inventory_path)):
+        sales_path,inventory_path=choose_files_interactive()
     if api_key is None:
         api_key=getpass.getpass('Keepa APIキーを入力（画面には表示されません）: ').strip()
 
@@ -339,22 +356,32 @@ def main(sales_path=None, inventory_path=None, master_path=None, api_key=None, o
         r['目標在庫日数']=target_days; r['目標在庫数']=target_stock
         r['推奨発注数']=ceil_unit(shortage,m.get('最小発注数'),m.get('発注単位'),m.get('ケース入数')) if r['90日販売']>0 else 0
 
-        sale_price=r.get('lowest_fba') or r.get('lowest_new') or r.get('new_price')
-        # Defensive validation: Keepa price should be a positive JPY amount.
+        # v1.4: 採算計算は現在のFBA最安値を最優先。FBA不在時のみ新品最安値へフォールバック。
+        if r.get('lowest_fba') is not None:
+            sale_price=r.get('lowest_fba'); price_type='FBA最安値'
+        elif r.get('lowest_new') is not None:
+            sale_price=r.get('lowest_new'); price_type='新品最安値（FBA不在）'
+        elif r.get('new_price') is not None:
+            sale_price=r.get('new_price'); price_type='Keepa新品価格（Offers未取得）'
+        else:
+            sale_price=None; price_type='価格取得不能'
         if sale_price is not None:
             sale_price=num(sale_price,0)
             if sale_price <= 0:
-                sale_price=None
+                sale_price=None; price_type='価格取得不能'
         cost=num(m.get('仕入単価(税抜)'),0)*(1+num(m.get('消費税率'),0))
         fee_rate=num(m.get('販売手数料率'),0); fba=num(m.get('FBA送料'),-1)
-        r['販売価格']=sale_price; r['税込仕入原価']=cost
+        r['販売価格']=sale_price; r['価格種別']=price_type; r['税込仕入原価']=cost
         if sale_price and fba>=0:
             profit=sale_price-cost-sale_price*fee_rate-fba
             roi=profit/cost if cost>0 else None
             r['1個利益']=round(profit); r['ROI']=roi; r['利益率']=profit/sale_price if sale_price else None
-            profitable=(profit>=PROFIT_MIN_YEN and (roi or 0)>=ROI_MIN)
+            profitable=((profit/sale_price) >= MIN_PROFIT_MARGIN) if sale_price else False
+            margin=r['利益率']
+            r['利益区分']='積極補充' if margin>=0.10 else '通常補充' if margin>=0.05 else '売上重視補充' if margin>=0.02 else '売上拡大型' if margin>=0 else '赤字'
+            r['45日予測売上高']=round(sale_price * forecast)
         else:
-            r['1個利益']=None; r['ROI']=None; r['利益率']=None; profitable=None
+            r['1個利益']=None; r['ROI']=None; r['利益率']=None; r['利益区分']='要確認'; r['45日予測売上高']=None; profitable=None
 
         cov=r['在庫カバー日数']
         if r['90日販売']<=0:
@@ -372,21 +399,26 @@ def main(sales_path=None, inventory_path=None, master_path=None, api_key=None, o
     # Output workbook.
     wb=Workbook(); ws=wb.active; ws.title='仕入れ指示'
     headers=['補充優先度','仕入判断','SKU','ASIN','商品名','現在庫','30日販売','90日販売','45日需要予測','在庫カバー日数',
-             '目標在庫日数','目標在庫数','推奨発注数','販売価格','税込仕入原価','1個利益','利益率','ROI','FBA競合数','Amazon本体','予測信頼度','需要方式']
+             '目標在庫日数','目標在庫数','推奨発注数','販売価格','価格種別','45日予測売上高','税込仕入原価','1個利益','利益率','ROI','利益区分','FBA競合数','Amazon本体','予測信頼度','需要方式']
     order={'1':1,'2':2,'3':3,'4':4,'5':5,'D':6}
     records.sort(key=lambda r:(order.get(str(r['補充優先度'])[0],9), r['在庫カバー日数'] if r['在庫カバー日数'] is not None else 99999,-r['45日需要予測']))
     ws.append(headers)
     for r in records:
-        ws.append([r.get('補充優先度'),r.get('仕入判断'),r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('在庫カバー日数'),r.get('目標在庫日数'),r.get('目標在庫数'),r.get('推奨発注数'),r.get('販売価格'),r.get('税込仕入原価'),r.get('1個利益'),r.get('利益率'),r.get('ROI'),r.get('fba_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('予測信頼度'),r.get('需要方式')])
+        ws.append([r.get('補充優先度'),r.get('仕入判断'),r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('在庫カバー日数'),r.get('目標在庫日数'),r.get('目標在庫数'),r.get('推奨発注数'),r.get('販売価格'),r.get('価格種別'),r.get('45日予測売上高'),r.get('税込仕入原価'),r.get('1個利益'),r.get('利益率'),r.get('ROI'),r.get('利益区分'),r.get('fba_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('予測信頼度'),r.get('需要方式')])
     blue='1F4E78'; thin=Side(style='thin',color='D9E1F2')
     for c in ws[1]: c.fill=PatternFill('solid',fgColor=blue); c.font=Font(bold=True,color='FFFFFF'); c.alignment=Alignment(horizontal='center',vertical='center',wrap_text=True)
     for row in ws.iter_rows():
         for c in row: c.border=Border(left=thin,right=thin,top=thin,bottom=thin); c.alignment=Alignment(vertical='top',wrap_text=True)
-    widths=[22,18,25,14,55,10,10,10,12,14,12,12,12,12,14,12,10,10,10,11,11,24]
+    widths=[22,18,25,14,55,10,10,10,12,14,12,12,12,12,22,16,14,12,10,10,16,10,11,11,24]
     for i,w in enumerate(widths,1): ws.column_dimensions[get_column_letter(i)].width=w
     ws.freeze_panes='F2'; ws.auto_filter.ref=ws.dimensions
+    col={name:i+1 for i,name in enumerate(headers)}
     for row in range(2,ws.max_row+1):
-        ws.cell(row,10).number_format='0.0"日"'; ws.cell(row,14).number_format='#,##0"円"'; ws.cell(row,15).number_format='#,##0"円"'; ws.cell(row,16).number_format='#,##0"円"'; ws.cell(row,17).number_format='0.0%'; ws.cell(row,18).number_format='0.0%'
+        ws.cell(row,col['在庫カバー日数']).number_format='0.0"日"'
+        for name in ('販売価格','45日予測売上高','税込仕入原価','1個利益'):
+            ws.cell(row,col[name]).number_format='#,##0"円"'
+        for name in ('利益率','ROI'):
+            ws.cell(row,col[name]).number_format='0.0%'
         p=str(ws.cell(row,1).value or '')
         fill='F8696B' if p.startswith('1') else 'F4B183' if p.startswith('2') else 'FFD966' if p.startswith('3') else 'FFF2CC' if p.startswith('4') else 'E2F0D9' if p.startswith('5') else 'D9EAD3'
         ws.cell(row,1).fill=PatternFill('solid',fgColor=fill); ws.cell(row,1).font=Font(bold=True)
@@ -400,25 +432,26 @@ def main(sales_path=None, inventory_path=None, master_path=None, api_key=None, o
     dash.append(['発注判断',sum(r['仕入判断']=='発注' for r in records)])
     dash.append(['推奨発注数合計',sum(r['推奨発注数'] for r in records)])
     dash.append(['利益要確認',sum(r['仕入判断']=='利益要確認' for r in records)])
+    dash.append(['最低利益率',f'{MIN_PROFIT_MARGIN:.1%}'])
+    dash.append(['仕入戦略','売上拡大モード'])
     dash.append(['売上基準日',end.date().isoformat()])
     for c in dash[1]: c.fill=PatternFill('solid',fgColor=blue); c.font=Font(bold=True,color='FFFFFF')
     dash.column_dimensions['A'].width=28; dash.column_dimensions['B'].width=20
 
     raw=wb.create_sheet('分析詳細')
-    detail_headers=['SKU','ASIN','商品名','現在庫','30日販売','90日販売','45日需要予測','SalesRank現在','Rank30日平均','Rank90日平均','新品価格','新品90日平均','FBA競合','FBM競合','Amazon本体','FBA最安値','Keepaエラー']
+    detail_headers=['SKU','ASIN','商品名','現在庫','30日販売','90日販売','45日需要予測','SalesRank現在','Rank30日平均','Rank90日平均','新品価格','新品90日平均','FBA競合','FBM競合','Amazon本体','FBA最安値','新品最安値','採用価格種別','Keepaエラー']
     raw.append(detail_headers)
     for r in records:
-        raw.append([r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('rank_now'),r.get('rank_avg30'),r.get('rank_avg90'),r.get('new_price'),r.get('new_avg90'),r.get('fba_count'),r.get('fbm_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('lowest_fba'),r.get('keepa_error') or r.get('offers_error')])
+        raw.append([r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('rank_now'),r.get('rank_avg30'),r.get('rank_avg90'),r.get('new_price'),r.get('new_avg90'),r.get('fba_count'),r.get('fbm_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('lowest_fba'),r.get('lowest_new'),r.get('価格種別'),r.get('keepa_error') or r.get('offers_error')])
     for c in raw[1]: c.fill=PatternFill('solid',fgColor=blue); c.font=Font(bold=True,color='FFFFFF')
     raw.freeze_panes='A2'; raw.auto_filter.ref=raw.dimensions
 
-    if output_path is None: output_path=f'replenishment_report_{end.strftime("%Y%m%d")}.xlsx'
+    if output_path is None:
+        output_path=unique_output_path(RESULT_DIR, f'DMD仕入れ判断_{end.strftime("%Y%m%d")}.xlsx')
+    else:
+        os.makedirs(str(Path(output_path).parent), exist_ok=True)
     wb.save(output_path)
-    print('完成:',output_path)
-    try:
-        from google.colab import files
-        files.download(output_path)
-    except Exception: pass
+    print('Google Driveへ保存完了:',output_path)
     return output_path
 
 if __name__=='__main__':
