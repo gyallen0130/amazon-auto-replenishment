@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DMD automatic replenishment decision system v1.4.1 (Google Drive master/output + sales-growth mode + FBA price basis)
+# DMD automatic replenishment decision system v1.4.2 (Google Drive master/output + sales-growth mode + FBA price basis)
 import os, re, math, time, getpass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -216,7 +216,7 @@ def classify_input_file(path):
 
 
 def check_google_drive():
-    """v1.4.1.1: Driveの認証UIは.py内から呼ばず、Colabセル側で事前マウントする。"""
+    """v1.4.2.1: Driveの認証UIは.py内から呼ばず、Colabセル側で事前マウントする。"""
     drive_root = Path('/content/drive')
     if not drive_root.exists():
         raise RuntimeError(
@@ -229,36 +229,53 @@ def check_google_drive():
 
 
 def choose_files_interactive():
-    """v1.4.1: 商品マスタはDrive固定。売上・在庫の2ファイルだけ選択する。"""
+    """v1.4.2: /content直下の売上・在庫ファイルを自動検出する。"""
+    base = Path('/content')
     supported = ('.xlsx', '.xlsm', '.csv')
-    try:
-        from google.colab import files
-        print('売上ファイルと在庫ファイルの2つを選択してください。')
-        print('※ 商品マスタはGoogle Driveから自動で読み込みます。')
-        uploaded = files.upload()
-        names = [n for n in uploaded.keys() if Path(n).suffix.lower() in supported]
-    except Exception:
-        names = [p.name for p in Path('.').iterdir() if p.suffix.lower() in supported]
+    names = [str(p) for p in base.iterdir()
+             if p.is_file() and p.suffix.lower() in supported
+             and p.name != 'product_master.xlsm'
+             and not p.name.startswith('DMD仕入れ判断_')]
+
+    # 新しいファイルを優先
+    names.sort(key=lambda n: Path(n).stat().st_mtime, reverse=True)
 
     found = {'inventory': [], 'sales': []}
     for n in names:
-        kind = classify_input_file(n)
+        try:
+            kind = classify_input_file(n)
+        except Exception:
+            continue
         if kind in found:
             found[kind].append(n)
 
+    # 列判定で拾えなかった場合のみファイル名を補助的に使用
     if not found['inventory']:
-        found['inventory'] = [n for n in names if '在庫' in n or 'inventory' in n.lower() or 'zaiko' in n.lower()]
+        found['inventory'] = [n for n in names
+                              if '在庫' in Path(n).name or 'inventory' in Path(n).name.lower()
+                              or 'zaiko' in Path(n).name.lower()]
     if not found['sales']:
-        found['sales'] = [n for n in names if 'transaction' in n.lower() or '売上' in n or 'sales' in n.lower() or 'uriage' in n.lower()]
+        found['sales'] = [n for n in names
+                          if 'transaction' in Path(n).name.lower() or '売上' in Path(n).name
+                          or 'sales' in Path(n).name.lower() or 'uriage' in Path(n).name.lower()]
 
-    result = {k: (v[0] if len(v) == 1 else None) for k, v in found.items()}
+    result = {
+        'inventory': found['inventory'][0] if found['inventory'] else None,
+        'sales': found['sales'][0] if found['sales'] else None,
+    }
     print('自動判別結果:', {'master': MASTER_PATH, **result})
-    if result['sales'] is None:
-        if len(found['sales']) > 1: print('売上候補:', found['sales'])
-        result['sales'] = input('売上ファイル名: ').strip()
-    if result['inventory'] is None:
-        if len(found['inventory']) > 1: print('在庫候補:', found['inventory'])
-        result['inventory'] = input('在庫ファイル名: ').strip()
+
+    missing = []
+    if result['sales'] is None: missing.append('売上CSV')
+    if result['inventory'] is None: missing.append('在庫CSV')
+    if missing:
+        raise FileNotFoundError(
+            '・'.join(missing) + ' を /content 直下から検出できませんでした。\n'
+            'Colab左側のファイル欄へ売上CSV・在庫CSVをアップロードしてから再実行してください。'
+        )
+
+    print('売上CSV:', Path(result['sales']).name)
+    print('在庫CSV:', Path(result['inventory']).name)
     return result['sales'], result['inventory']
 
 
@@ -359,7 +376,7 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         r['目標在庫日数']=target_days; r['目標在庫数']=target_stock
         r['推奨発注数']=ceil_unit(shortage,m.get('最小発注数'),m.get('発注単位'),m.get('ケース入数')) if r['90日販売']>0 else 0
 
-        # v1.4.1: 採算計算は現在のFBA最安値を最優先。FBA不在時のみ新品最安値へフォールバック。
+        # v1.4.2: 採算計算は現在のFBA最安値を最優先。FBA不在時のみ新品最安値へフォールバック。
         if r.get('lowest_fba') is not None:
             sale_price=r.get('lowest_fba'); price_type='FBA最安値'
         elif r.get('lowest_new') is not None:
