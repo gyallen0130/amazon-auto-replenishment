@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# DMD automatic replenishment decision system v1.4.2 (Google Drive master/output + sales-growth mode + FBA price basis)
+# DMD automatic replenishment decision system v1.4.3 (stale inventory + Business Report + cart warning + visual alerts)
 import os, re, math, time, getpass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,6 +18,10 @@ DEFAULT_LEAD_DAYS = 7
 DEFAULT_SAFETY_DAYS = 7
 MIN_PROFIT_MARGIN = 0.0  # 売上拡大モード: 利益率0%以上を仕入れ候補
 OFFERS_COVER_DAYS = 30
+BUSINESS_MIN_SESSIONS = 30
+CART_RED_PCT = 10.0
+CART_ORANGE_PCT = 30.0
+CART_YELLOW_PCT = 50.0
 MASTER_PATH = '/content/drive/MyDrive/02_AI業務効率化/AI仕入れ判断/product_master.xlsm'
 RESULT_DIR = '/content/drive/MyDrive/02_AI業務効率化/AI仕入れ判断/01_出力結果'
 
@@ -28,7 +32,8 @@ def _looks_like_header(row):
     sales_score = sum(x in vals for x in ('日付/時間','トランザクションの種類','SKU','数量'))
     inventory_score = sum(x in vals for x in ('出品者SKU','ASIN','販売できる数量'))
     master_score = sum(x in vals for x in ('SKU','ASIN','商品名','仕入単価(税抜)'))
-    return sales_score >= 3 or inventory_score >= 2 or master_score >= 3
+    business_score = sum(x in vals for x in ('SKU','（子）ASIN','セッション数 - 合計','おすすめ出品（おすすめ商品）の獲得率'))
+    return sales_score >= 3 or inventory_score >= 2 or master_score >= 3 or business_score >= 3
 
 
 def normalize_table(rows):
@@ -93,8 +98,19 @@ def parse_dt(v):
 def num(v, default=0.0):
     try:
         if v is None or v == '' or str(v).upper() in ('#N/A','N/A','NONE'): return default
-        return float(v)
+        s=str(v).strip().replace(',', '').replace('￥','').replace('¥','')
+        if s.endswith('%'): return float(s[:-1]) / 100.0
+        return float(s)
     except: return default
+
+def pct_value(v):
+    """Business Reportの%文字列を0〜100の百分率へ。例: '27.00%' -> 27.0"""
+    if v is None or str(v).strip()=='' : return None
+    s=str(v).strip().replace(',', '')
+    try:
+        return float(s[:-1]) if s.endswith('%') else float(s) * (100.0 if float(s) <= 1 else 1.0)
+    except:
+        return None
 
 
 def ceil_unit(qty, minimum=1, unit=1, case=1):
@@ -212,6 +228,9 @@ def classify_input_file(path):
     # Amazonトランザクション/売上レポート
     if {'トランザクションの種類','SKU','数量'}.issubset(headers) and ('日付/時間' in headers or '日付' in headers):
         return 'sales'
+    # ビジネスレポート：詳細ページ 売上・トラフィック（子商品別）
+    if {'SKU','（子）ASIN','セッション数 - 合計','おすすめ出品（おすすめ商品）の獲得率'}.issubset(headers):
+        return 'business'
     return None
 
 
@@ -240,7 +259,7 @@ def choose_files_interactive():
     # 新しいファイルを優先
     names.sort(key=lambda n: Path(n).stat().st_mtime, reverse=True)
 
-    found = {'inventory': [], 'sales': []}
+    found = {'inventory': [], 'sales': [], 'business': []}
     for n in names:
         try:
             kind = classify_input_file(n)
@@ -258,10 +277,13 @@ def choose_files_interactive():
         found['sales'] = [n for n in names
                           if 'transaction' in Path(n).name.lower() or '売上' in Path(n).name
                           or 'sales' in Path(n).name.lower() or 'uriage' in Path(n).name.lower()]
+    # Business Reportは似た名前の日別レポートがあるため、ファイル名だけでは補完しない。
+    # 子商品別の必須列が揃うファイルだけを採用する。
 
     result = {
         'inventory': found['inventory'][0] if found['inventory'] else None,
         'sales': found['sales'][0] if found['sales'] else None,
+        'business': found['business'][0] if found['business'] else None,
     }
     print('自動判別結果:', {'master': MASTER_PATH, **result})
 
@@ -276,7 +298,11 @@ def choose_files_interactive():
 
     print('売上CSV:', Path(result['sales']).name)
     print('在庫CSV:', Path(result['inventory']).name)
-    return result['sales'], result['inventory']
+    if result['business']:
+        print('ビジネスレポート:', Path(result['business']).name)
+    else:
+        print('ビジネスレポート: 未検出（カート関連列は空欄で続行）')
+    return result['sales'], result['inventory'], result['business']
 
 
 def unique_output_path(result_dir, base_name):
@@ -291,19 +317,20 @@ def unique_output_path(result_dir, base_name):
         if not candidate.exists(): return str(candidate)
         i += 1
 
-def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=None, output_path=None):
+def main(sales_path=None, inventory_path=None, business_path=None, master_path=MASTER_PATH, api_key=None, output_path=None):
     check_google_drive()
     if not os.path.exists(master_path):
         raise FileNotFoundError(f'商品マスタが見つかりません: {master_path}')
     print(f'商品マスタ: OK\n  {master_path}')
     if not all((sales_path, inventory_path)):
-        sales_path,inventory_path=choose_files_interactive()
+        sales_path,inventory_path,business_path=choose_files_interactive()
     if api_key is None:
         api_key=getpass.getpass('Keepa APIキーを入力（画面には表示されません）: ').strip()
 
     sales=rows_as_dicts(read_tabular(sales_path))
     inv=rows_as_dicts(read_tabular(inventory_path))
     master=rows_as_dicts(read_tabular(master_path))
+    business=rows_as_dicts(read_tabular(business_path)) if business_path else []
     master=[r for r in master if str(r.get('SKU') or '').startswith(DMD_PREFIX) and str(r.get('有効') or '有効')!='停止']
 
     dates=[parse_dt(r.get('日付/時間')) for r in sales if str(r.get('トランザクションの種類') or '')=='注文']
@@ -311,12 +338,13 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
     if not dates: raise ValueError('売上ファイルから注文日を取得できません。')
     end=max(dates); start30=end-timedelta(days=29); start90=end-timedelta(days=89)
 
-    s30={}; s90={}
+    s30={}; s90={}; last_sale={}
     for r in sales:
         sku=str(r.get('SKU') or '')
         if not sku.startswith(DMD_PREFIX) or str(r.get('トランザクションの種類') or '')!='注文': continue
         d=parse_dt(r.get('日付/時間')); q=num(r.get('数量'),0)
         if not d: continue
+        if q > 0 and (sku not in last_sale or d > last_sale[sku]): last_sale[sku]=d
         if d>=start90: s90[sku]=s90.get(sku,0)+q
         if d>=start30: s30[sku]=s30.get(sku,0)+q
 
@@ -327,6 +355,18 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         stock[sku]=stock.get(sku,0)+num(r.get('販売できる数量') if '販売できる数量' in r else r.get('現在庫'),0)
         if r.get('ASIN'): asin_inv[sku]=r.get('ASIN')
 
+    # Business ReportはSKUで直接結合。DMD以外は対象外。
+    business_by_sku={}
+    for r in business:
+        sku=str(r.get('SKU') or '').strip()
+        if not sku.startswith(DMD_PREFIX): continue
+        business_by_sku[sku]={
+            'セッション数': int(num(r.get('セッション数 - 合計'),0)),
+            'カート獲得率': pct_value(r.get('おすすめ出品（おすすめ商品）の獲得率')),
+            'BR注文点数': int(num(r.get('注文された商品点数'),0)),
+            'BRユニットセッション率': pct_value(r.get('ユニットセッション率')),
+        }
+
     records=[]
     print(f'DMD商品マスタ: {len(master)} SKU / 売上基準日: {end.date()}')
     # First pass: basic Keepa data for all master SKUs.
@@ -334,6 +374,17 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         sku=str(m.get('SKU')); asin=str(m.get('ASIN') or asin_inv.get(sku) or '')
         rec={'SKU':sku,'ASIN':asin,'商品名':m.get('商品名'),'現在庫':stock.get(sku,0),
              '30日販売':s30.get(sku,0),'90日販売':s90.get(sku,0),'master':m}
+        rec.update(business_by_sku.get(sku, {'セッション数':None,'カート獲得率':None,'BR注文点数':None,'BRユニットセッション率':None}))
+        ls=last_sale.get(sku)
+        rec['最終販売日']=ls.date().isoformat() if ls else '90日以内なし'
+        rec['無販売日数']=(end.date()-ls.date()).days if ls else 90
+        if rec['現在庫'] > 0:
+            if ls is None or rec['無販売日数'] >= 90: rec['滞留アラート']='90日以上販売なし'
+            elif rec['無販売日数'] >= 60: rec['滞留アラート']='60日以上販売なし'
+            elif rec['無販売日数'] >= 30: rec['滞留アラート']='30日以上販売なし'
+            else: rec['滞留アラート']=''
+        else:
+            rec['滞留アラート']=''
         if asin:
             try:
                 wait_for_tokens(api_key,3)
@@ -354,6 +405,35 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
             r['45日需要予測']=0; r['予測信頼度']='参考'; r['需要方式']='販売実績なし（自動発注しない）'
         daily=r['45日需要予測']/45 if r['45日需要予測'] else 0
         r['在庫カバー日数']=r['現在庫']/daily if daily>0 else None
+
+        # カート獲得率は単独で警告しない。直近30日の販売失速と組み合わせる。
+        sessions=r.get('セッション数'); cart=r.get('カート獲得率')
+        prior60=max(0, r['90日販売']-r['30日販売'])
+        prior30pace=prior60/2.0
+        r['前60日月換算販売']=round(prior30pace,1)
+        if prior30pace > 0:
+            r['販売速度比']=r['30日販売']/prior30pace
+        else:
+            r['販売速度比']=None
+        alert=''
+        if sessions is None or cart is None:
+            alert='データなし'
+        elif sessions < BUSINESS_MIN_SESSIONS:
+            alert='データ不足'
+        elif prior30pace > 0:
+            ratio=r['販売速度比']
+            if cart < CART_RED_PCT and ratio < 0.70:
+                alert='異常：低カート＋販売大幅低下'
+            elif cart < CART_ORANGE_PCT and ratio < 0.80:
+                alert='要注意：低カート＋販売低下'
+            elif cart < CART_YELLOW_PCT and ratio < 0.90:
+                alert='注意：カート低下＋販売やや低下'
+            else:
+                alert='問題なし'
+        else:
+            # 比較期間に販売がない場合、カート0%でも現在売れていれば警告しない。
+            alert='問題なし' if r['30日販売'] > 0 else ('要確認：販売実績なし' if cart < CART_ORANGE_PCT else '問題なし')
+        r['カート獲得アラート']=alert
 
     offer_targets=[r for r in records if r['90日販売']>0 and (r['現在庫']==0 or (r['在庫カバー日数'] is not None and r['在庫カバー日数']<=OFFERS_COVER_DAYS))]
     print(f'Offers取得対象: {len(offer_targets)} SKU（在庫カバー{OFFERS_COVER_DAYS}日以下）')
@@ -392,6 +472,7 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         cost=num(m.get('仕入単価(税抜)'),0)*(1+num(m.get('消費税率'),0))
         fee_rate=num(m.get('販売手数料率'),0); fba=num(m.get('FBA送料'),-1)
         r['販売価格']=sale_price; r['価格種別']=price_type; r['税込仕入原価']=cost
+        r['現在庫金額']=round(cost * r['現在庫'])
         if sale_price and fba>=0:
             profit=sale_price-cost-sale_price*fee_rate-fba
             roi=profit/cost if cost>0 else None
@@ -413,35 +494,82 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
         elif cov is not None and cov<=21: priority='3 早め（21日以内）'; decision='発注' if profitable else ('利益要確認' if profitable is None else '見送り（利益不足）')
         elif cov is not None and cov<=30: priority='4 注意（30日以内）'; decision='発注準備' if profitable else ('利益要確認' if profitable is None else '見送り（利益不足）')
         else: priority='5 当面不要'; decision='補充不要'
+        # 在庫が残ったまま30日以上売れていないSKUは追加補充しない。
+        if r.get('滞留アラート'):
+            priority='5 当面不要（滞留）'
+            decision='補充不要（滞留在庫）'
         r['補充優先度']=priority; r['仕入判断']=decision
-        if decision.startswith('見送り') or decision=='利益要確認': r['推奨発注数']=0
+        if decision.startswith('見送り') or decision=='利益要確認' or decision.startswith('補充不要'): r['推奨発注数']=0
 
     # Output workbook.
     wb=Workbook(); ws=wb.active; ws.title='仕入れ指示'
-    headers=['補充優先度','仕入判断','SKU','ASIN','商品名','現在庫','30日販売','90日販売','45日需要予測','在庫カバー日数',
+    headers=['補充優先度','仕入判断','SKU','ASIN','商品名','現在庫','現在庫金額','30日販売','90日販売','最終販売日','無販売日数','滞留アラート',
+             'セッション数','カート獲得率','販売速度比','カート獲得アラート','45日需要予測','在庫カバー日数',
              '目標在庫日数','目標在庫数','推奨発注数','販売価格','価格種別','45日予測売上高','税込仕入原価','1個利益','利益率','ROI','利益区分','FBA競合数','Amazon本体','予測信頼度','需要方式']
     order={'1':1,'2':2,'3':3,'4':4,'5':5,'D':6}
     records.sort(key=lambda r:(order.get(str(r['補充優先度'])[0],9), r['在庫カバー日数'] if r['在庫カバー日数'] is not None else 99999,-r['45日需要予測']))
     ws.append(headers)
     for r in records:
-        ws.append([r.get('補充優先度'),r.get('仕入判断'),r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('在庫カバー日数'),r.get('目標在庫日数'),r.get('目標在庫数'),r.get('推奨発注数'),r.get('販売価格'),r.get('価格種別'),r.get('45日予測売上高'),r.get('税込仕入原価'),r.get('1個利益'),r.get('利益率'),r.get('ROI'),r.get('利益区分'),r.get('fba_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('予測信頼度'),r.get('需要方式')])
+        ws.append([r.get('補充優先度'),r.get('仕入判断'),r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('現在庫金額'),r.get('30日販売'),r.get('90日販売'),r.get('最終販売日'),('90日以上' if r.get('最終販売日')=='90日以内なし' else r.get('無販売日数')),r.get('滞留アラート'),r.get('セッション数'),(r.get('カート獲得率')/100 if r.get('カート獲得率') is not None else None),(r.get('販売速度比')),r.get('カート獲得アラート'),r.get('45日需要予測'),r.get('在庫カバー日数'),r.get('目標在庫日数'),r.get('目標在庫数'),r.get('推奨発注数'),r.get('販売価格'),r.get('価格種別'),r.get('45日予測売上高'),r.get('税込仕入原価'),r.get('1個利益'),r.get('利益率'),r.get('ROI'),r.get('利益区分'),r.get('fba_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('予測信頼度'),r.get('需要方式')])
     blue='1F4E78'; thin=Side(style='thin',color='D9E1F2')
     for c in ws[1]: c.fill=PatternFill('solid',fgColor=blue); c.font=Font(bold=True,color='FFFFFF'); c.alignment=Alignment(horizontal='center',vertical='center',wrap_text=True)
     for row in ws.iter_rows():
         for c in row: c.border=Border(left=thin,right=thin,top=thin,bottom=thin); c.alignment=Alignment(vertical='top',wrap_text=True)
-    widths=[22,18,25,14,55,10,10,10,12,14,12,12,12,12,22,16,14,12,10,10,16,10,11,11,24]
+    widths=[22,20,25,14,55,10,14,10,10,14,12,20,12,12,12,28,12,14,12,12,12,12,22,16,14,12,10,10,16,10,11,11,24]
     for i,w in enumerate(widths,1): ws.column_dimensions[get_column_letter(i)].width=w
     ws.freeze_panes='F2'; ws.auto_filter.ref=ws.dimensions
     col={name:i+1 for i,name in enumerate(headers)}
+    colors={'darkgreen':'548235','green':'70AD47','lightgreen':'C6E0B4','yellow':'FFD966','orange':'F4B183','red':'C00000','gray':'D9E1F2'}
+    def paint(cell, color, white=False):
+        cell.fill=PatternFill('solid',fgColor=colors[color]); cell.font=Font(bold=True,color=('FFFFFF' if white else '000000'))
     for row in range(2,ws.max_row+1):
         ws.cell(row,col['在庫カバー日数']).number_format='0.0"日"'
-        for name in ('販売価格','45日予測売上高','税込仕入原価','1個利益'):
+        for name in ('現在庫金額','販売価格','45日予測売上高','税込仕入原価','1個利益'):
             ws.cell(row,col[name]).number_format='#,##0"円"'
-        for name in ('利益率','ROI'):
+        for name in ('カート獲得率','販売速度比','利益率','ROI'):
             ws.cell(row,col[name]).number_format='0.0%'
-        p=str(ws.cell(row,1).value or '')
-        fill='F8696B' if p.startswith('1') else 'F4B183' if p.startswith('2') else 'FFD966' if p.startswith('3') else 'FFF2CC' if p.startswith('4') else 'E2F0D9' if p.startswith('5') else 'D9EAD3'
-        ws.cell(row,1).fill=PatternFill('solid',fgColor=fill); ws.cell(row,1).font=Font(bold=True)
+
+        # 補充優先度：仕入れる方向を緑、注意を黄、不要を灰色。
+        p=str(ws.cell(row,col['補充優先度']).value or '')
+        if p.startswith('1'): paint(ws.cell(row,col['補充優先度']),'darkgreen',True)
+        elif p.startswith('2'): paint(ws.cell(row,col['補充優先度']),'green')
+        elif p.startswith('3'): paint(ws.cell(row,col['補充優先度']),'lightgreen')
+        elif p.startswith('4'): paint(ws.cell(row,col['補充優先度']),'yellow')
+        else: paint(ws.cell(row,col['補充優先度']),'gray')
+
+        d=str(ws.cell(row,col['仕入判断']).value or '')
+        if d=='発注': paint(ws.cell(row,col['仕入判断']),'darkgreen',True)
+        elif d=='発注準備': paint(ws.cell(row,col['仕入判断']),'lightgreen')
+        elif '利益要確認' in d: paint(ws.cell(row,col['仕入判断']),'orange')
+        elif d.startswith('見送り'): paint(ws.cell(row,col['仕入判断']),'red',True)
+        else: paint(ws.cell(row,col['仕入判断']),'gray')
+
+        profit_class=str(ws.cell(row,col['利益区分']).value or '')
+        if profit_class=='積極補充': paint(ws.cell(row,col['利益区分']),'darkgreen',True)
+        elif profit_class=='通常補充': paint(ws.cell(row,col['利益区分']),'lightgreen')
+        elif profit_class=='売上重視補充': paint(ws.cell(row,col['利益区分']),'yellow')
+        elif profit_class=='売上拡大型': paint(ws.cell(row,col['利益区分']),'orange')
+        elif profit_class=='赤字': paint(ws.cell(row,col['利益区分']),'red',True)
+        else: paint(ws.cell(row,col['利益区分']),'gray')
+
+        stale=str(ws.cell(row,col['滞留アラート']).value or '')
+        if stale.startswith('90'): paint(ws.cell(row,col['滞留アラート']),'red',True)
+        elif stale.startswith('60'): paint(ws.cell(row,col['滞留アラート']),'orange')
+        elif stale.startswith('30'): paint(ws.cell(row,col['滞留アラート']),'yellow')
+
+        cart_alert=str(ws.cell(row,col['カート獲得アラート']).value or '')
+        if cart_alert.startswith('異常'): paint(ws.cell(row,col['カート獲得アラート']),'red',True)
+        elif cart_alert.startswith('要注意') or cart_alert.startswith('要確認'): paint(ws.cell(row,col['カート獲得アラート']),'orange')
+        elif cart_alert.startswith('注意'): paint(ws.cell(row,col['カート獲得アラート']),'yellow')
+        elif cart_alert=='問題なし': paint(ws.cell(row,col['カート獲得アラート']),'lightgreen')
+        else: paint(ws.cell(row,col['カート獲得アラート']),'gray')
+
+        margin=ws.cell(row,col['利益率']).value
+        if isinstance(margin,(int,float)):
+            if margin>=.10: paint(ws.cell(row,col['利益率']),'darkgreen',True)
+            elif margin>=.05: paint(ws.cell(row,col['利益率']),'lightgreen')
+            elif margin>=0: paint(ws.cell(row,col['利益率']),'yellow')
+            else: paint(ws.cell(row,col['利益率']),'red',True)
 
     dash=wb.create_sheet('サマリー')
     dash.append(['指標','件数/数量'])
@@ -452,6 +580,9 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
     dash.append(['発注判断',sum(r['仕入判断']=='発注' for r in records)])
     dash.append(['推奨発注数合計',sum(r['推奨発注数'] for r in records)])
     dash.append(['利益要確認',sum(r['仕入判断']=='利益要確認' for r in records)])
+    dash.append(['30日以上滞留',sum(bool(r.get('滞留アラート')) for r in records)])
+    dash.append(['滞留在庫金額',sum(r.get('現在庫金額',0) for r in records if r.get('滞留アラート'))])
+    dash.append(['カート警告',sum(str(r.get('カート獲得アラート','')).startswith(('注意','要注意','異常','要確認')) for r in records)])
     dash.append(['最低利益率',f'{MIN_PROFIT_MARGIN:.1%}'])
     dash.append(['仕入戦略','売上拡大モード'])
     dash.append(['売上基準日',end.date().isoformat()])
@@ -459,10 +590,10 @@ def main(sales_path=None, inventory_path=None, master_path=MASTER_PATH, api_key=
     dash.column_dimensions['A'].width=28; dash.column_dimensions['B'].width=20
 
     raw=wb.create_sheet('分析詳細')
-    detail_headers=['SKU','ASIN','商品名','現在庫','30日販売','90日販売','45日需要予測','SalesRank現在','Rank30日平均','Rank90日平均','新品価格','新品90日平均','FBA競合','FBM競合','Amazon本体','FBA最安値','新品最安値','採用価格種別','Keepaエラー']
+    detail_headers=['SKU','ASIN','商品名','現在庫','現在庫金額','30日販売','90日販売','最終販売日','無販売日数','滞留アラート','セッション数','カート獲得率','前60日月換算販売','販売速度比','カート獲得アラート','45日需要予測','SalesRank現在','Rank30日平均','Rank90日平均','新品価格','新品90日平均','FBA競合','FBM競合','Amazon本体','FBA最安値','新品最安値','採用価格種別','Keepaエラー']
     raw.append(detail_headers)
     for r in records:
-        raw.append([r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('30日販売'),r.get('90日販売'),r.get('45日需要予測'),r.get('rank_now'),r.get('rank_avg30'),r.get('rank_avg90'),r.get('new_price'),r.get('new_avg90'),r.get('fba_count'),r.get('fbm_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('lowest_fba'),r.get('lowest_new'),r.get('価格種別'),r.get('keepa_error') or r.get('offers_error')])
+        raw.append([r.get('SKU'),r.get('ASIN'),r.get('商品名'),r.get('現在庫'),r.get('現在庫金額'),r.get('30日販売'),r.get('90日販売'),r.get('最終販売日'),('90日以上' if r.get('最終販売日')=='90日以内なし' else r.get('無販売日数')),r.get('滞留アラート'),r.get('セッション数'),(r.get('カート獲得率')/100 if r.get('カート獲得率') is not None else None),r.get('前60日月換算販売'),r.get('販売速度比'),r.get('カート獲得アラート'),r.get('45日需要予測'),r.get('rank_now'),r.get('rank_avg30'),r.get('rank_avg90'),r.get('new_price'),r.get('new_avg90'),r.get('fba_count'),r.get('fbm_count'),r.get('amazon_offers') or r.get('amazon_present'),r.get('lowest_fba'),r.get('lowest_new'),r.get('価格種別'),r.get('keepa_error') or r.get('offers_error')])
     for c in raw[1]: c.fill=PatternFill('solid',fgColor=blue); c.font=Font(bold=True,color='FFFFFF')
     raw.freeze_panes='A2'; raw.auto_filter.ref=raw.dimensions
 
